@@ -427,6 +427,11 @@ __REMOTE_DNS_UPSTREAMS__
       - exec: $lazy_cache
       - matches: has_resp
         exec: accept
+      # 3.5 PTR 反查(qtype 12): 不分国内外本地裁决 —— 内网反查不出网(局域网无权威 PTR, NXDOMAIN 标准), 公网 PTR 本地同样可解析
+      - matches: qtype 12
+        exec: $local_sequence
+      - matches: has_resp
+        exec: accept
       # 4. 国内域名 → 国内 DNS
       - matches: qname $geosite_cn
         exec: $local_sequence
