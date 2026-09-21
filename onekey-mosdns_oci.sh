@@ -270,6 +270,11 @@ UNPACKEOF
     [ -f "${RULE_DIR}/$f" ] || touch "${RULE_DIR}/$f"
   done
   info "  ✓ 自定义规则模板已创建 (whitelist/blocklist/hosts)"
+  # tailscale 控制面专用规则(固定内容): 破解 “远程 DNS 依赖 tailnet” 死循环 —— 冷启动时 tailscaled
+  # 必须解析 controlplane/log/derp(均在 tailscale.com 下), 若只走 forward_remote(100.x) 必然失败
+  # 见 PROJECT_MEMORY: 死循环原理与实测日志
+  printf 'domain:tailscale.com\n' > "${RULE_DIR}/ts_control_plane.txt"
+  info "  ✓ tailscale 控制面规则已写入 (ts_control_plane.txt)"
 
   # 写入 config.yaml（容器内路径 /etc/mosdns/...，参照 onekey-mosdns.sh）
   info "  --- 写入 config.yaml ---"
@@ -321,6 +326,12 @@ plugins:
     type: hosts
     args:
       files: ["/etc/mosdns/rule/hosts.txt"]
+
+  # tailscale 控制面(破 DNS⇄tailscale 死循环, 固定内容见 rule/ts_control_plane.txt)
+  - tag: ts_control_plane
+    type: domain_set
+    args:
+      files: ["/etc/mosdns/rule/ts_control_plane.txt"]
 
   # ========== 缓存 ==========
   - tag: lazy_cache
@@ -411,6 +422,11 @@ __REMOTE_DNS_UPSTREAMS__
   - tag: main_sequence
     type: sequence
     args:
+      # 0. tailscale 控制面 → 国内公共 DNS(不依赖 tailnet, 破 DNS⇄tailscale 死循环)
+      - matches: qname $ts_control_plane
+        exec: $forward_local
+      - matches: has_resp
+        exec: accept
       # 1. 白名单直通国内
       - matches: qname $whitelist
         exec: $forward_local
