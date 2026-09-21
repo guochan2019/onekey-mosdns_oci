@@ -11,6 +11,8 @@
 wget -O onekey-mosdns_oci.sh https://raw.githubusercontent.com/guochan2019/onekey-mosdns_oci/main/onekey-mosdns_oci.sh
 # 运行（交互：容器 ID + root 密码 + IP/网关）
 bash onekey-mosdns_oci.sh
+# 卸载（停+销毁容器 → 删 /opt/mosdns → 清 crontab 项，有确认提示）
+bash onekey-mosdns_oci.sh uninstall [CTID]
 ```
 
 ## 脚本流程
@@ -41,10 +43,23 @@ bash onekey-mosdns_oci.sh
 
 crontab 每周一 03:00 执行 `/opt/mosdns/update-mosdns_oci.sh`（宿主 root 下）：
 
-1. **更新 GEO 数据** — 重下 `geoip.dat` + `geosite.dat`（Loyalsoldier/v2ray-rules-dat 最新 release），解包全部域名规则 + geoip CIDR（实测约 33 万条规则）
+1. **更新 GEO 数据** — 重下 `geoip.dat` + `geosite.dat`（Loyalsoldier/v2ray-rules-dat 最新 release，走镜像 fallback），解包全部域名规则 + geoip CIDR（实测约 33 万条规则）
 2. **重启容器重载** — `pct reboot <CTID>` 使新规则生效
 
 更新日志：`/opt/mosdns/update-mosdns.log`。也可手动执行 `bash /opt/mosdns/update-mosdns_oci.sh`。
+
+## 卸载
+
+```bash
+bash onekey-mosdns_oci.sh uninstall          # 默认 CTID 取脚本内配置（104）
+bash onekey-mosdns_oci.sh uninstall 105      # 指定 CTID
+```
+
+有确认提示（回答非 `y` 则什么都不做），确认后依次执行：
+
+1. `pct stop <CTID>` → `pct destroy <CTID> --purge`（容器不存在时告警跳过）
+2. `rm -rf /opt/mosdns`（config.yaml / 规则 / GEO 数据 / 更新日志）
+3. 清除 crontab 中的 `update-mosdns_oci` 项（其余条目保留）
 
 ## 注意事项
 
@@ -52,12 +67,12 @@ crontab 每周一 03:00 执行 `/opt/mosdns/update-mosdns_oci.sh`（宿主 root 
 2. **`--cmode shell` 在 OCI 创建流程不写入 conf**，脚本用 `pct set` 显式设置。
 3. **`/opt/mosdns` 存在即保留**：配置/规则持久化，重建容器不丢失（不存在则自动下载数据）。如需全新数据，先删除该目录再重跑。
 4. **镜像事实**：`irinesistiana/mosdns:latest` 为 alpine 精简镜像（无 curl/dig），验证走宿主 python3 原生 DNS 查询；镜像 CMD `mosdns start --dir /etc/mosdns` 自动成为容器 PID1。
-5. **GEO 数据**：首次运行下载 `geoip.dat`(17M) + `geosite.dat`(11M) 并解包 4 个规则文件（国内域名 / 国外域名 / 广告 / 国内 IP），存储在 `/opt/mosdns/`。
+5. **GEO 数据**：首次运行下载 `geoip.dat`(17M) + `geosite.dat`(11M) 并解包 4 个规则文件（国内域名 / 国外域名 / 广告 / 国内 IP），存储在 `/opt/mosdns/`。下载走镜像 fallback（`gh-proxy.com` → `ghfast.top` → 官方直连），GitHub 直连受限的宿主也能装/更新。
 6. **日志**：`/opt/mosdns/mosdns.log`（容器写入挂载点，宿主可直接 tail）。国外上游部分超时 WARN 属正常降级（concurrent 机制首个成功即返回）。
 7. **DNS 生效**：LAN 设备 DNS 指向容器 IP 即启用分流（国内域名→本地 DNS、国外域名→**tailnet VPS dnsmasq**（部署时输入的 `udp://100.x` 三台并发）、广告域名 NXDOMAIN 屏蔽）。
 8. **tailscale 控制面专用解析（2026-09-21）**：`tailscale.com` 及其子域固定走**国内 DNS**（规则文件 `ts_control_plane.txt` + `main_sequence` 第 0 步 `qname $ts_control_plane → $forward_local`）——破解“VPN 注册依赖 DNS、DNS 又依赖 VPN”的冷启动死循环；**远程 DNS（国外分流）不受影响**。⚠️ 已部署的旧容器配置不会被重写（见注 3）⇒ 需手工在 `${DATA_DIR}/config.yaml` 补上这两处（或删除 `${DATA_DIR}` 重跑脚本重新生成，注意会重新下载 GEO 数据），再重启容器生效。
-8. **IPv6 不配置**（net0 留空）；**DNS 设为 127.0.0.1**（PVE `--nameserver` 机制，容器内 `/etc/resolv.conf` 指向本机 mosdns——容器内程序解析走本地分流/缓存，不绕过）；MAC 由 PVE 随机生成；firewall=0。
-9. **远程上游不依赖 daed（2026-09-06 架构变更）**：原 tls/https 直连 1.1.1.1/8.8.8.8 依赖 LinuxGate daed eBPF 劫持出墙；现改为 `udp://<tailnet VPS IP>`（VPS 上部署 dnsmasq，见 `guochan2019/onekey-vps_dns`）。🔴 **隐私：本地/远程 DNS 上游均首次部署交互输入，仓库零私有地址**（tailnet IP/本地运营商 DNS 不进 GitHub）。
+9. **IPv6 不配置**（net0 留空）；**DNS 设为 127.0.0.1**（PVE `--nameserver` 机制，容器内 `/etc/resolv.conf` 指向本机 mosdns——容器内程序解析走本地分流/缓存，不绕过）；MAC 由 PVE 随机生成；firewall=0。
+10. **远程上游不依赖 daed（2026-09-06 架构变更）**：原 tls/https 直连 1.1.1.1/8.8.8.8 依赖 LinuxGate daed eBPF 劫持出墙；现改为 `udp://<tailnet VPS IP>`（VPS 上部署 dnsmasq，见 `guochan2019/onekey-vps_dns`）。🔴 **隐私：本地/远程 DNS 上游均首次部署交互输入，仓库零私有地址**（tailnet IP/本地运营商 DNS 不进 GitHub）。
 
 ## 验证
 

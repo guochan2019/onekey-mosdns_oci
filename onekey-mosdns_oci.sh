@@ -2,6 +2,8 @@
 # ============================================================
 # onekey-mosdns_oci — PVE 一键重建 OCI MosDNS CT（OCI-MosDNS）
 # 适用环境: PVE 9.1+（OCI 支持），宿主 root 运行
+# 用法: bash onekey-mosdns_oci.sh                      # 安装 / 重建（重建=拉最新镜像）
+#       bash onekey-mosdns_oci.sh uninstall [CTID]     # 卸载（停+销毁容器、删 DATA_DIR、清 crontab 项）
 # 功能: 拉 OCI 镜像 → 建特权 CT → 配置持久化/规则数据 → 启动验证
 #       国内+国外DNS分流 + 广告屏蔽 + 缓存（配置/规则参照 onekey-mosdns.sh）
 # 🔴 隐私: 本地/远程 DNS 上游均首次部署交互输入(LOCAL_DNS_IPS/REMOTE_DNS_IPS), 不写死进仓库
@@ -32,8 +34,8 @@ command -v python3 &>/dev/null || err "未找到 python3（GEO 数据解包依�
 # ---------- 配置 ----------
 CTID=104
 CT_NAME="OCI-MosDNS"
-CT_IP="192.168.50.5/24"
-CT_GW="192.168.50.1"
+CT_IP="192.168.1.5/24"
+CT_GW="192.168.1.1"
 TPL_REF="docker://irinesistiana/mosdns:latest"
 TPL_NAME="mosdns_latest.tar"
 VZTPL_DIR="/var/lib/vz/template/cache"
@@ -49,6 +51,50 @@ LOCAL_DNS_IPS=""
 # 远程 DNS 上游(forward_remote, 空格分隔纯 IP = tailnet VPS dnsmasq 的 100.x)
 # 🔴 隐私: 不写死进仓库(暴露 tailnet 拓扑) —— 首次部署必填交互输入, 可预设
 REMOTE_DNS_IPS=""
+
+# ---------- GitHub 下载带镜像 fallback: gh-proxy.com → ghfast.top → 官方直连 ----------
+# $1 = 完整 URL (github.com / raw.githubusercontent.com), $2 = 输出文件
+dl_gh() {
+  for p in "https://gh-proxy.com/" "https://ghfast.top/" ""; do  # 镜像优先, 官方垫底(直连受限场景不白等超时)
+    if wget -q --timeout=20 -O "$2" "${p}$1"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# ---------- 卸载模式 ----------
+# 用法: bash onekey-mosdns_oci.sh uninstall [CTID]   （CTID 不传则取上方配置区的默认值）
+if [ "${1:-}" = "uninstall" ]; then
+  command -v pct &>/dev/null || err "未找到 pct，请确认在 PVE 宿主上运行"
+  U_CTID="${2:-${CTID}}"
+  warn "========== 卸载 OCI MosDNS =========="
+  echo "  将执行："
+  echo "    1) 停止并销毁容器 ${U_CTID}"
+  echo "    2) 删除持久化目录 ${DATA_DIR}（config.yaml / 规则 / GEO 数据 / 更新日志）"
+  echo "    3) 清除 crontab 中的 update-mosdns_oci 项"
+  echo -n "  确认卸载? (y/N) "
+  read -r U_ANS
+  case "${U_ANS}" in
+    y|Y) ;;
+    *) info "已取消，未做任何改动"; exit 0 ;;
+  esac
+  pct stop "${U_CTID}" 2>/dev/null || true
+  if pct status "${U_CTID}" &>/dev/null; then
+    if pct destroy "${U_CTID}" --purge 2>/dev/null; then
+      info "  ✓ 容器 ${U_CTID} 已销毁"
+    else
+      warn "  ⚠ 容器 ${U_CTID} 销毁失败，请手工检查 pct status ${U_CTID}"
+    fi
+  else
+    warn "  ⚠ 容器 ${U_CTID} 不存在（可能已销毁），跳过"
+  fi
+  rm -rf "${DATA_DIR}" && info "  ✓ 已删除 ${DATA_DIR}"
+  (set +e; crontab -l 2>/dev/null | grep -v update-mosdns_oci) | crontab - 2>/dev/null || true
+  info "  ✓ 已清除 crontab 中的 update-mosdns_oci 项"
+  info "✓ 卸载完成"
+  exit 0
+fi
 
 # ---------- 检测 local 存储模板目录 ----------
 if [ ! -d "${VZTPL_DIR}" ]; then
@@ -83,7 +129,7 @@ echo ""
 [ -n "${CT_PASS}" ] || err "密码不能为空"
 info "  ✓ root 密码已设置（不回显）"
 
-# 容器 IP / 网关（默认 192.168.50.5/24、192.168.50.1）
+# 容器 IP / 网关（默认 192.168.1.5/24、192.168.1.1）
 read -p "请输入容器 IP (默认 ${CT_IP}): " CT_IP_INPUT </dev/tty
 CT_IP=${CT_IP_INPUT:-${CT_IP}}
 read -p "请输入网关 IP (默认 ${CT_GW}): " CT_GW_INPUT </dev/tty
@@ -121,10 +167,12 @@ if [ ! -f "${DATA_DIR}/config.yaml" ]; then
   # 下载 GEO 数据（Loyalsoldier/v2ray-rules-dat，与 onekey-mosdns.sh 同源）
   info "  --- 下载 GEO 数据 ---"
   echo -n "    下载 geoip.dat ... "
-  wget -q "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat" -O "${DATA_DIR}/geoip.dat"
+  dl_gh "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat" "${DATA_DIR}/geoip.dat" \
+    || err "geoip.dat 下载失败(镜像+官方均不可用)"
   echo "done ($(du -h "${DATA_DIR}/geoip.dat" | cut -f1))"
   echo -n "    下载 geosite.dat ... "
-  wget -q "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat" -O "${DATA_DIR}/geosite.dat"
+  dl_gh "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat" "${DATA_DIR}/geosite.dat" \
+    || err "geosite.dat 下载失败(镜像+官方均不可用)"
   echo "done ($(du -h "${DATA_DIR}/geosite.dat" | cut -f1))"
 
   # 安装 GEO 数据解包工具（与 onekey-mosdns.sh 同一脚本）
@@ -521,11 +569,20 @@ RULE_DIR="${RULE_DIR}"
 UNPACK="${UNPACK_SCRIPT}"
 LOG="${DATA_DIR}/update-mosdns.log"
 log() { echo "[\$(date '+%Y-%m-%d %H:%M:%S')] \$*" | tee -a "\$LOG"; }
+# GitHub 下载带镜像 fallback（与安装时同一策略：镜像优先, 官方垫底）
+dl_gh() {
+  for p in "https://gh-proxy.com/" "https://ghfast.top/" ""; do
+    if wget -q --timeout=20 -O "\$2" "\${p}\$1"; then
+      return 0
+    fi
+  done
+  return 1
+}
 log "=== 开始更新 ==="
 log "1/2 更新 GEO 数据..."
-wget -q "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat" -O "\${DATA_DIR}/geoip.dat.new" || { log "  ✗ geoip.dat 下载失败"; exit 1; }
+dl_gh "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat" "\${DATA_DIR}/geoip.dat.new" || { log "  ✗ geoip.dat 下载失败(镜像+官方均不可用)"; exit 1; }
 mv "\${DATA_DIR}/geoip.dat.new" "\${DATA_DIR}/geoip.dat"
-wget -q "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat" -O "\${DATA_DIR}/geosite.dat.new" || { log "  ✗ geosite.dat 下载失败"; exit 1; }
+dl_gh "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat" "\${DATA_DIR}/geosite.dat.new" || { log "  ✗ geosite.dat 下载失败(镜像+官方均不可用)"; exit 1; }
 mv "\${DATA_DIR}/geosite.dat.new" "\${DATA_DIR}/geosite.dat"
 python3 "\$UNPACK" geosite "\${DATA_DIR}/geosite.dat" CN              > "\${RULE_DIR}/geosite_cn.txt" 2>/dev/null
 python3 "\$UNPACK" geosite "\${DATA_DIR}/geosite.dat" GEOLOCATION-!CN > "\${RULE_DIR}/geosite_geolocation-!cn.txt" 2>/dev/null
